@@ -1,0 +1,22 @@
+[package]
+name = "ms-pac-forge"
+version = "0.1.0-dev"
+edition = "2021"
+license = "MIT"
+authors = ["zevs"]
+description = "MS-PAC (Privilege Attribute Certificate) marshaling + Golden/Silver Kerberos ticket forgery. Pure-Rust, byte-validated against a live Server 2025 KDC. Pre-alpha, extracted from adhammer."
+rust-version = "1.80"
+
+[dependencies]
+anyhow          = "1"
+picky-krb       = "0.9"
+picky-asn1      = "0.10"
+picky-asn1-der  = "0.5"
+md-5            = "0.10"
+md4             = "0.10"
+hmac            = "0.12"
+rand            = "0.8"
+hex             = "0.4"
+
+[dev-dependencies]
+hex = "0.4"
