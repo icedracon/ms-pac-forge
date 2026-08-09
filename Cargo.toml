@@ -4,8 +4,13 @@ version = "0.1.0-dev"
 edition = "2021"
 license = "MIT"
 authors = ["zevs"]
-description = "MS-PAC (Privilege Attribute Certificate) marshaling + Golden/Silver Kerberos ticket forgery. Pure-Rust, byte-validated against a live Server 2025 KDC. Pre-alpha, extracted from adhammer."
+description = "MS-PAC (Privilege Attribute Certificate) marshaling + Golden/Silver Kerberos ticket forgery, pure-Rust, byte-validated against a live Server 2025 KDC (pre-alpha, extracted from adhammer)"
 rust-version = "1.80"
+repository = "https://github.com/icedracon/ms-pac-forge"
+documentation = "https://docs.rs/ms-pac-forge"
+readme = "README.md"
+keywords = ["ms-pac", "kerberos", "golden-ticket", "active-directory", "red-team"]
+categories = ["authentication", "cryptography", "parser-implementations", "os::windows-apis"]
 
 [dependencies]
 anyhow          = "1"
