@@ -4,7 +4,7 @@
 [![Docs.rs](https://docs.rs/ms-pac-forge/badge.svg)](https://docs.rs/ms-pac-forge)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-Pure-Rust [MS-PAC](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-pac/) marshaling and Golden / Silver Kerberos ticket forgery. For AD red-teamers and detection engineers who want a scriptable, embeddable ticket forge without shelling out to Rubeus or Impacket. Part of the [icedracon](https://github.com/icedracon) offensive-AD Rust ecosystem, extracted from `adhammer` 1.3.1.
+Pure-Rust [MS-PAC](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-pac/) marshaling and Golden / Silver Kerberos ticket forgery. For AD red-teamers and detection engineers who want a scriptable, embeddable ticket forge without shelling out to popular Kerberos clients or spec-vector captures. Part of the [icedracon](https://github.com/icedracon) offensive-AD Rust ecosystem, extracted from `adhammer` 1.3.1.
 
 ## Status
 
@@ -43,7 +43,7 @@ let _cipher = tgt.ticket_cipher();
 ## What works / what does not (this version)
 
 - ✅ Working: `KERB_VALIDATION_INFO` NDR build + parse (byte-verified vs live 2025 KDC), `PAC_CLIENT_INFO` / `PAC_ATTRIBUTES` / `PAC_REQUESTOR` / `SERVER_CHECKSUM` / `KDC_CHECKSUM` buffers, Golden TGT forge (krbtgt-sealed, AES256 or RC4), Silver TGS forge (service-account-sealed), RC4-HMAC (etype 23) + `KERB_CHECKSUM_HMAC_MD5` (-138) hand-rolls, KB5020805 extended-signatures posture.
-- ⚠ Deferred: Diamond (TGS-REP tamper) and Sapphire (S4U2self-driven, KB5020805-native from the start — breaks the Rubeus-only monopoly on this technique) modes. Full PAC dissector for arbitrary buffers beyond `KERB_VALIDATION_INFO`. AS/TGS transport (see `ms-kile`).
+- ⚠ Deferred: Diamond (TGS-REP tamper) and Sapphire (S4U2self-driven, KB5020805-native from the start — breaks the popular Kerberos clients-only monopoly on this technique) modes. Full PAC dissector for arbitrary buffers beyond `KERB_VALIDATION_INFO`. AS/TGS transport (see `ms-kile`).
 
 ## Related icedracon crates
 
