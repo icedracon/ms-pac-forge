@@ -11,6 +11,17 @@ project adheres to [SemVer](https://semver.org/spec/v2.0.0.html).
 - Typed `PacForgeError` enum planned for the next feature bump (0.2.0);
   today the crate uses `anyhow::Result` for CLI-friendliness.
 
+## [0.1.3] — 2026-08-23
+
+### Added
+- `ForgeIdentity.extra_sids: Vec<Vec<u32>>` — populates PAC's
+  `KERB_VALIDATION_INFO.SidCount` + `ExtraSids` (KERB_SID_AND_ATTRIBUTES
+  conformant array, MS-PAC 2.5) for cross-forest golden-ticket forging.
+  Empty vec = same on-wire layout as 0.1.2 (backwards-compat, verified
+  byte-for-byte in `extra_sids_empty_matches_previous_layout`).
+- `impl Default for ForgeIdentity` (unblocks `..Default::default()` at
+  call sites).
+
 ## [0.1.2] — 2026-08-16
 
 ### Fixed

