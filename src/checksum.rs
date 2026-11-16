@@ -76,7 +76,9 @@ pub fn rc4_encrypt(
     out
 }
 
-/// RC4-HMAC decrypt. Verifies the HMAC checksum; returns the plaintext (confounder stripped).
+/// RC4-HMAC decrypt. Verifies the HMAC checksum in constant time (1.5.3 audit M-1 — kerbcore's
+/// own rc4::decrypt uses CT compare, this brings ms-pac-forge to parity), then returns the
+/// plaintext (confounder stripped).
 pub fn rc4_decrypt(key: &[u8], usage: i32, ciphertext: &[u8]) -> Result<Vec<u8>, &'static str> {
     if ciphertext.len() < 16 + 8 {
         return Err("RC4-HMAC ciphertext too short");
@@ -85,10 +87,28 @@ pub fn rc4_decrypt(key: &[u8], usage: i32, ciphertext: &[u8]) -> Result<Vec<u8>,
     let ki = hmac_md5(key, &usage_t(usage));
     let ke = hmac_md5(&ki, cksum);
     let data = rc4_apply(&ke, enc);
-    if hmac_md5(&ki, &data) != cksum {
+    let expected = hmac_md5(&ki, &data);
+    if !ct_eq_16(&expected, cksum) {
         return Err("RC4-HMAC checksum mismatch (wrong key)");
     }
     Ok(data[8..].to_vec())
+}
+
+/// Constant-time equality for a fixed 16-byte HMAC-MD5 tag. Volatile-black-box read of the OR
+/// accumulator so the optimiser can't short-circuit the loop; both slices are always fully
+/// traversed regardless of where they first differ (mirrors `subtle::ConstantTimeEq` on `[u8;16]`).
+#[inline(always)]
+fn ct_eq_16(a: &[u8], b: &[u8]) -> bool {
+    debug_assert_eq!(a.len(), 16);
+    debug_assert_eq!(b.len(), 16);
+    let mut acc: u8 = 0;
+    for i in 0..16 {
+        // `read_volatile` around the accumulator prevents the optimiser from breaking
+        // constant-time by observing `acc != 0` and exiting early.
+        acc |= a[i] ^ b[i];
+        acc = std::hint::black_box(acc);
+    }
+    acc == 0
 }
 
 /// KERB_CHECKSUM_HMAC_MD5 (checksum type -138, RFC 4757 §4) — the PAC signature

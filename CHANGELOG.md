@@ -5,11 +5,54 @@ All notable changes to `ms-pac-forge` will be documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 project adheres to [SemVer](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.0] — 2026-10-29
 
-### Notes
-- Typed `PacForgeError` enum planned for the next feature bump (0.2.0);
-  today the crate uses `anyhow::Result` for CLI-friendliness.
+### Added
+- **Diamond ticket forgery (`diamond` module).** `forge_diamond_tgt` decrypts a
+  real TGT with the krbtgt key, preserves its flags / session key / timestamps,
+  and swaps only the identity-carrying PAC + cname. `build_diamond_ticket` exposes
+  the rebuild step for callers that already hold a decrypted `EncTicketPart`.
+- **Sapphire / S4U2Self primitives (`sapphire` module).** `build_pa_for_user`
+  (PA-FOR-USER padata, type 129; HMAC-MD5 checksum at key usage 17 over an RC4 TGT
+  session key), `extract_pac_from_enc_ticket_part`, and
+  `forge_sapphire_service_ticket` (mint a service ticket around a KDC-populated
+  PAC, both signatures re-signed under the service key). No KDC transport — the
+  S4U2Self wire exchange lives in adhammer-kerberos.
+- `pac::re_sign_pac` is now public (used by the Sapphire path).
+- Constant-time RC4-HMAC checksum compare in `checksum::rc4_decrypt` (audit M-1).
+- `#![forbid(unsafe_code)]` crate-wide (audit M-3).
+
+### Changed
+- **Crypto + DER backend swapped `picky-krb` → `kerbcore` 0.3.** EncTicketPart
+  build/parse and AES256-CTS-HMAC-SHA1-96 now go through kerbcore's from-scratch,
+  no-panic DER + RFC 3961 crypto; RC4-HMAC stays on the crate's own `checksum`.
+  Key usages (2 for the sealed ticket, 17 for PAC checksums) and the on-wire DER
+  layout are unchanged from the picky-validated version. Dropped dependencies:
+  `picky-krb`, `picky-asn1`, `picky-asn1-der`, `anyhow`.
+- **BREAKING — typed errors.** Every public function now returns
+  `Result<T, PacForgeError>` (a `thiserror` enum) instead of `anyhow::Result<T>`.
+  Callers can match specific modes: `Decode`, `Encode`, `Decrypt`, `Encrypt`,
+  `Signature`, `MissingBuffer(u32)`, `Truncated`, `NoAuthData`,
+  `InvalidVersion(u32)`, `InvalidIdentity`. `PacForgeError` implements
+  `std::error::Error`, so existing `?`-into-`anyhow` call sites keep compiling.
+  `checksum::rc4_decrypt` keeps its `Result<_, &'static str>` signature.
+- `PacForgeError` is `#[non_exhaustive]` — future variants are additive (patch), not breaking.
+- MSRV raised to **1.88** (was an inaccurate `1.80`, then `1.85`). picky-krb is
+  gone; the floor is now set by the `kerbcore` 0.3 dependency (rust-version 1.88).
+
+### Validation
+- Crypto-backend: the picky→kerbcore swap preserves the key usages and on-wire DER,
+  and kerbcore's RFC 3961/3962 primitives are known-answer-tested. Against a live
+  Windows Server 2025 DC: AES256 **golden** TGT accepted (TGS-REP for krbtgt); AES256
+  **silver** ticket authenticated over SMB (Kerberos AP-REQ → `C$` tree-connect);
+  **golden + ExtraSids** (foreign-SID injection) accepted (TGS-REP for ldap/); **diamond**
+  crypto confirmed (DC decrypted the ticket; policy-rejected with KDC_ERR_TGT_REVOKED
+  from KB5020805 PAC-consistency checks — a technique limitation, not a crypto bug).
+  Together these exercise both PAC signatures (KDC + server), the ExtraSids NDR path,
+  and multiple SPNs. RC4 is rejected by this DC's etype policy and rests on unit + KAT
+  coverage; Sapphire remains in-crate-test-only. `cargo publish --dry-run` verified
+  against the registry `kerbcore = "0.3"` (89 KiB, 16 files, clean verify-build).
+  Crate stays pre-alpha.
 
 ## [0.1.3] — 2026-08-23
 

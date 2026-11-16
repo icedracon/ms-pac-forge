@@ -9,11 +9,8 @@
 //! 4-byte-aligned; deferred region ending 8-aligned) was validated
 //! byte-for-byte against a live Windows Server 2025 PAC.
 
-use anyhow::{anyhow, bail, Result};
-use picky_asn1::wrapper::ExplicitContextTag10;
-use picky_asn1_der::application_tag::ApplicationTag;
-use picky_krb::crypto::{ChecksumSuite, CipherSuite};
-use picky_krb::data_types::{AuthorizationData, EncTicketPart};
+use crate::{PacForgeError, Result};
+use kerbcore::acceptor::EncTicketPart;
 
 use crate::checksum;
 
@@ -41,7 +38,7 @@ impl Nd {
         self.b.extend_from_slice(v);
     }
     fn align(&mut self, n: usize) {
-        while self.b.len() % n != 0 {
+        while !self.b.len().is_multiple_of(n) {
             self.b.push(0);
         }
     }
@@ -269,10 +266,11 @@ const SIG_HMAC_SHA1_96_AES256: i32 = 16;
 const KERB_NON_KERB_CKSUM_SALT: i32 = 17;
 
 fn aes256_checksum(key: &[u8], payload: &[u8]) -> Result<Vec<u8>> {
-    ChecksumSuite::HmacSha196Aes256
-        .hasher()
-        .checksum(key, KERB_NON_KERB_CKSUM_SALT, payload)
-        .map_err(|e| anyhow!("PAC checksum: {e}"))
+    // HMAC-SHA1-96-AES256 (cksumtype 16) over the PAC at the KERB-NON-KERB salt usage, via
+    // kerbcore's typed key (RFC 3961 Kc-derived HMAC-SHA1-96) — replaces picky's ChecksumSuite.
+    let k = kerbcore::KerberosKey::from_i32(18, key.to_vec())
+        .map_err(|e| PacForgeError::Signature(format!("PAC checksum key: {e}")))?;
+    Ok(k.checksum(KERB_NON_KERB_CKSUM_SALT as u32, payload))
 }
 
 /// Assemble a signed PACTYPE from the forged buffers.
@@ -392,15 +390,12 @@ fn descriptor_offset_len(pac: &[u8], parsed: &ParsedPac, ul_type: u32) -> Result
         .buffers
         .iter()
         .position(|b| b.ul_type == ul_type)
-        .ok_or_else(|| anyhow!("PAC missing buffer type {ul_type}"))?;
+        .ok_or(PacForgeError::MissingBuffer(ul_type))?;
     let base = 8 + idx * 16;
     let size = u32::from_le_bytes(pac[base + 4..base + 8].try_into().unwrap()) as usize;
     let offset = u64::from_le_bytes(pac[base + 8..base + 16].try_into().unwrap()) as usize;
     Ok((offset, size))
 }
-
-/// EncTicketPart is `[APPLICATION 3] SEQUENCE` on the wire.
-type EncTicketPartApp = ApplicationTag<EncTicketPart, 3>;
 
 /// key usage 2 — EncTicketPart sealed under the server (here krbtgt) key.
 const KEY_USAGE_TICKET: i32 = 2;
@@ -436,12 +431,12 @@ impl ParsedPac {
 /// Parse a PACTYPE container (MS-PAC 2.3).
 pub fn parse_pac(pac: &[u8]) -> Result<ParsedPac> {
     if pac.len() < 8 {
-        bail!("PAC too short");
+        return Err(PacForgeError::Truncated("PAC too short".into()));
     }
     let c_buffers = u32::from_le_bytes(pac[0..4].try_into().unwrap()) as usize;
     let version = u32::from_le_bytes(pac[4..8].try_into().unwrap());
     if version != 0 {
-        bail!("PAC version {version} != 0");
+        return Err(PacForgeError::InvalidVersion(version));
     }
     // Bounded-alloc preflight: c_buffers is attacker-controlled (comes from
     // the first 4 bytes of the PAC blob). Each PAC_INFO_BUFFER header is 16
@@ -450,23 +445,27 @@ pub fn parse_pac(pac: &[u8]) -> Result<ParsedPac> {
     // stops a hostile PAC with c_buffers = 0xFFFF_FFFF from claiming 128 GB.
     let max_buffers = pac.len().saturating_sub(8) / 16;
     if c_buffers > max_buffers {
-        bail!(
+        return Err(PacForgeError::Truncated(format!(
             "PAC c_buffers={c_buffers} exceeds physical max {max_buffers} for {}-byte blob",
             pac.len()
-        );
+        )));
     }
     let mut buffers = Vec::with_capacity(c_buffers);
     for i in 0..c_buffers {
         let base = 8 + i * 16;
         let hdr = pac
             .get(base..base + 16)
-            .ok_or_else(|| anyhow!("truncated PAC_INFO_BUFFER {i}"))?;
+            .ok_or_else(|| PacForgeError::Truncated(format!("truncated PAC_INFO_BUFFER {i}")))?;
         let ul_type = u32::from_le_bytes(hdr[0..4].try_into().unwrap());
         let size = u32::from_le_bytes(hdr[4..8].try_into().unwrap()) as usize;
         let offset = u64::from_le_bytes(hdr[8..16].try_into().unwrap()) as usize;
         let data = pac
             .get(offset..offset + size)
-            .ok_or_else(|| anyhow!("PAC buffer {i} range {offset}+{size} out of bounds"))?
+            .ok_or_else(|| {
+                PacForgeError::Truncated(format!(
+                    "PAC buffer {i} range {offset}+{size} out of bounds"
+                ))
+            })?
             .to_vec();
         buffers.push(PacBuf { ul_type, data });
     }
@@ -489,22 +488,37 @@ pub fn buf_name(t: u32) -> &'static str {
     }
 }
 
-/// Pull the PAC bytes out of an EncTicketPart's authorization-data:
-/// AD-IF-RELEVANT (type 1) → inner AuthorizationData → AD-WIN2K-PAC (type 128).
-pub fn extract_pac(auth: &ExplicitContextTag10<AuthorizationData>) -> Result<Vec<u8>> {
-    let val = |b: &[u8]| b.iter().fold(0i64, |a, &x| (a << 8) | x as i64);
-    for outer in &auth.0 .0 {
-        if val(&outer.ad_type.0 .0) == 1 {
-            let inner: AuthorizationData = picky_asn1_der::from_bytes(&outer.ad_data.0 .0)
-                .map_err(|e| anyhow!("decode AD-IF-RELEVANT: {e}"))?;
-            for e in &inner.0 {
-                if val(&e.ad_type.0 .0) == 128 {
-                    return Ok(e.ad_data.0 .0.clone());
+/// Pull the PAC bytes out of an EncTicketPart's raw authorization-data (`SEQUENCE OF
+/// AuthorizationData`): AD-IF-RELEVANT (type 1) → inner SEQUENCE OF → AD-WIN2K-PAC (type 128).
+/// 1.5.3: walks the DER via kerbcore's total decoder (was picky `AuthorizationData`).
+pub fn extract_pac(auth_data: &[u8]) -> Result<Vec<u8>> {
+    use kerbcore::der::{context_tag, one_or, Der, TAG_OCTET_STRING, TAG_SEQUENCE};
+    fn walk(seq_of: &[u8]) -> Option<Vec<u8>> {
+        let mut r = Der::new(seq_of);
+        while !r.is_empty() {
+            let (_, elem) = r.read_tlv().ok()?;
+            let mut er = Der::new(elem);
+            let ad_type = {
+                let mut i = Der::new(er.expect(context_tag(0)).ok()?);
+                i.read_integer().ok()?
+            };
+            let ad_data = one_or(er.expect(context_tag(1)).ok()?, TAG_OCTET_STRING).ok()?;
+            match ad_type {
+                128 => return Some(ad_data.to_vec()), // AD-WIN2K-PAC
+                1 => {
+                    // AD-IF-RELEVANT — its ad-data is itself a SEQUENCE OF AuthorizationData.
+                    if let Some(p) = walk(one_or(ad_data, TAG_SEQUENCE).ok()?) {
+                        return Some(p);
+                    }
                 }
+                _ => {}
             }
         }
+        None
     }
-    bail!("no AD-WIN2K-PAC in ticket authorization-data")
+    let seq = one_or(auth_data, TAG_SEQUENCE)
+        .map_err(|e| PacForgeError::Decode(format!("authorization-data: {e:?}")))?;
+    walk(seq).ok_or(PacForgeError::NoAuthData)
 }
 
 /// Decrypt an EncTicketPart ciphertext with an AES256 key (usage 2) and return
@@ -515,19 +529,21 @@ pub fn decrypt_ticket_pac_aes256(
     ticket_cipher: &[u8],
     krbtgt_aes256: &[u8],
 ) -> Result<(EncTicketPart, Vec<u8>)> {
-    let cipher = CipherSuite::Aes256CtsHmacSha196.cipher();
-    let plain = cipher
-        .decrypt(krbtgt_aes256, KEY_USAGE_TICKET, ticket_cipher)
-        .map_err(|e| anyhow!("decrypt EncTicketPart with AES256 key (wrong key?): {e}"))?;
-    let etp: EncTicketPart = picky_asn1_der::from_bytes::<EncTicketPartApp>(&plain)
-        .map_err(|e| anyhow!("decode EncTicketPart: {e}"))?
-        .0;
-    let auth = etp
-        .authorization_data
-        .0
-        .as_ref()
-        .ok_or_else(|| anyhow!("ticket has no authorization-data (no PAC)"))?;
-    let pac = extract_pac(auth)?;
+    let key = kerbcore::KerberosKey::from_i32(18, krbtgt_aes256.to_vec())
+        .map_err(|e| PacForgeError::Decrypt(format!("AES256 key: {e}")))?;
+    let plain = key
+        .decrypt(KEY_USAGE_TICKET as u32, ticket_cipher)
+        .map_err(|e| {
+            PacForgeError::Decrypt(format!(
+                "decrypt EncTicketPart with AES256 key (wrong key?): {e}"
+            ))
+        })?;
+    let etp = kerbcore::acceptor::parse_enc_ticket_part(&plain)
+        .map_err(|e| PacForgeError::Decode(format!("decode EncTicketPart: {e:?}")))?;
+    if etp.authorization_data.is_empty() {
+        return Err(PacForgeError::NoAuthData);
+    }
+    let pac = extract_pac(&etp.authorization_data)?;
     Ok((etp, pac))
 }
 
@@ -537,16 +553,13 @@ pub fn decrypt_ticket_pac_rc4(
     nt_hash_key: &[u8],
 ) -> Result<(EncTicketPart, Vec<u8>)> {
     let plain = checksum::rc4_decrypt(nt_hash_key, KEY_USAGE_TICKET, ticket_cipher)
-        .map_err(|e| anyhow!("decrypt EncTicketPart with RC4 key: {e}"))?;
-    let etp: EncTicketPart = picky_asn1_der::from_bytes::<EncTicketPartApp>(&plain)
-        .map_err(|e| anyhow!("decode EncTicketPart: {e}"))?
-        .0;
-    let auth = etp
-        .authorization_data
-        .0
-        .as_ref()
-        .ok_or_else(|| anyhow!("ticket has no authorization-data (no PAC)"))?;
-    let pac = extract_pac(auth)?;
+        .map_err(|e| PacForgeError::Decrypt(format!("decrypt EncTicketPart with RC4 key: {e}")))?;
+    let etp = kerbcore::acceptor::parse_enc_ticket_part(&plain)
+        .map_err(|e| PacForgeError::Decode(format!("decode EncTicketPart: {e:?}")))?;
+    if etp.authorization_data.is_empty() {
+        return Err(PacForgeError::NoAuthData);
+    }
+    let pac = extract_pac(&etp.authorization_data)?;
     Ok((etp, pac))
 }
 
@@ -674,9 +687,15 @@ mod tests {
             "empty extra_sids must not change on-wire bytes vs 0.1.2 layout"
         );
         // SidCount slot (body offset 196 + 20-byte preamble = output offset 216).
-        assert_eq!(u32::from_le_bytes(baseline[216..220].try_into().unwrap()), 0);
+        assert_eq!(
+            u32::from_le_bytes(baseline[216..220].try_into().unwrap()),
+            0
+        );
         // ExtraSids ptr slot (output offset 220).
-        assert_eq!(u32::from_le_bytes(baseline[220..224].try_into().unwrap()), 0);
+        assert_eq!(
+            u32::from_le_bytes(baseline[220..224].try_into().unwrap()),
+            0
+        );
     }
 
     /// A single foreign SID lands in the KERB_VALIDATION_INFO with SidCount=1,

