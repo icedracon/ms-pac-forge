@@ -19,7 +19,7 @@ thiserror      = "2"
 # the whole adhammer tree can drop picky-krb. kerbcore 0.3.0 is published on crates.io;
 # the `path` is dev convenience — on publish the dep resolves to `kerbcore = "0.3"` from
 # the registry. kerbcore 0.3 sets this crate's MSRV floor (1.88).
-kerbcore        = { path = "../kerbcore", version = "0.3" }
+kerbcore        = "0.3"
 md-5            = "0.10"
 md4             = "0.10"
 hmac            = "0.12"
